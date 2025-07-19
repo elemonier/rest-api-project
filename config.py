@@ -1,8 +1,8 @@
 import logging
 import os
 
-# Database configuration
-DATABASE_URL = "sqlite:///./items.db"
+# Database configuration is now handled in database.py
+# This allows for environment-based database selection
 
 # Logging configuration
 logging.basicConfig(

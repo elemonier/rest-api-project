@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List
 import logging
@@ -14,6 +15,15 @@ app = FastAPI(
     version=API_VERSION,
     docs_url="/docs",
     redoc_url="/redoc"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.on_event("startup")
