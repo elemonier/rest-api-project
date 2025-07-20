@@ -5,9 +5,10 @@ from sqlalchemy.orm import Session
 from typing import List
 import logging
 
-from database import get_db, create_tables, Item
-from schemas import ItemCreate, ItemResponse, ErrorResponse
+from database import get_db, create_tables, Item, User
+from schemas import ItemCreate, ItemResponse, ErrorResponse, UserCreate, UserResponse, UserLogin, Token
 from config import API_TITLE, API_DESCRIPTION, API_VERSION, logger
+from auth import get_password_hash, authenticate_user, create_access_token, get_current_user
 
 app = FastAPI(
     title=API_TITLE,
@@ -43,18 +44,107 @@ async def global_exception_handler(request, exc):
 async def root():
     return {"message": "Items API", "docs": "/docs", "redoc": "/redoc"}
 
-@app.get("/items", response_model=List[ItemResponse], status_code=status.HTTP_200_OK)
-async def get_all_items(db: Session = Depends(get_db)):
+# Authentication endpoints
+@app.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+async def register_user(user: UserCreate, db: Session = Depends(get_db)):
     """
-    Retrieve all items from the database.
+    Register a new user account.
     
+    Args:
+        user (UserCreate): User registration data
+        
     Returns:
-        List[ItemResponse]: List of all items in the database
+        UserResponse: The created user information
     """
     try:
-        logger.info("Fetching all items from database")
-        items = db.query(Item).all()
-        logger.info(f"Successfully retrieved {len(items)} items")
+        logger.info(f"Attempting to register user: {user.email}")
+        
+        # Check if user already exists
+        existing_user = db.query(User).filter(User.email == user.email).first()
+        if existing_user:
+            logger.warning(f"User with email '{user.email}' already exists")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"User with email '{user.email}' already exists"
+            )
+        
+        # Create new user
+        hashed_password = get_password_hash(user.password)
+        db_user = User(email=user.email, hashed_password=hashed_password)
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        
+        logger.info(f"Successfully registered user with ID: {db_user.id}")
+        return db_user
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error registering user: {e}")
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to register user"
+        )
+
+@app.post("/auth/login", response_model=Token)
+async def login_user(user_credentials: UserLogin, db: Session = Depends(get_db)):
+    """
+    Login with email and password to get access token.
+    
+    Args:
+        user_credentials (UserLogin): Login credentials
+        
+    Returns:
+        Token: Access token and user information
+    """
+    try:
+        logger.info(f"Login attempt for user: {user_credentials.email}")
+        
+        # Authenticate user
+        user = authenticate_user(user_credentials.email, user_credentials.password, db)
+        if not user:
+            logger.warning(f"Failed login attempt for user: {user_credentials.email}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password"
+            )
+        
+        # Create access token
+        access_token = create_access_token(data={"sub": user.email})
+        
+        logger.info(f"Successful login for user: {user.email}")
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": user
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during login: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Login failed"
+        )
+
+@app.get("/items", response_model=List[ItemResponse], status_code=status.HTTP_200_OK)
+async def get_all_items(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Retrieve all items for the authenticated user.
+    
+    Returns:
+        List[ItemResponse]: List of items owned by the current user
+    """
+    try:
+        logger.info(f"Fetching items for user: {current_user.email}")
+        items = db.query(Item).filter(Item.owner_id == current_user.id).all()
+        logger.info(f"Successfully retrieved {len(items)} items for user {current_user.email}")
         return items
     except Exception as e:
         logger.error(f"Error fetching items: {e}")
@@ -64,9 +154,13 @@ async def get_all_items(db: Session = Depends(get_db)):
         )
 
 @app.post("/items", response_model=ItemResponse, status_code=status.HTTP_201_CREATED)
-async def create_item(item: ItemCreate, db: Session = Depends(get_db)):
+async def create_item(
+    item: ItemCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
-    Create a new item in the database.
+    Create a new item for the authenticated user.
     
     Args:
         item (ItemCreate): The item data to create
@@ -75,24 +169,31 @@ async def create_item(item: ItemCreate, db: Session = Depends(get_db)):
         ItemResponse: The created item with its ID and timestamp
     """
     try:
-        logger.info(f"Creating new item: {item.name}")
+        logger.info(f"Creating new item: {item.name} for user: {current_user.email}")
         
-        # Check if item with same name already exists
-        existing_item = db.query(Item).filter(Item.name == item.name).first()
+        # Check if item with same name already exists for this user
+        existing_item = db.query(Item).filter(
+            Item.name == item.name,
+            Item.owner_id == current_user.id
+        ).first()
         if existing_item:
-            logger.warning(f"Item with name '{item.name}' already exists")
+            logger.warning(f"Item with name '{item.name}' already exists for user {current_user.email}")
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Item with name '{item.name}' already exists"
             )
         
         # Create new item
-        db_item = Item(name=item.name, description=item.description)
+        db_item = Item(
+            name=item.name,
+            description=item.description,
+            owner_id=current_user.id
+        )
         db.add(db_item)
         db.commit()
         db.refresh(db_item)
         
-        logger.info(f"Successfully created item with ID: {db_item.id}")
+        logger.info(f"Successfully created item with ID: {db_item.id} for user: {current_user.email}")
         return db_item
         
     except HTTPException:
@@ -106,9 +207,13 @@ async def create_item(item: ItemCreate, db: Session = Depends(get_db)):
         )
 
 @app.get("/items/{item_id}", response_model=ItemResponse, status_code=status.HTTP_200_OK)
-async def get_item(item_id: int, db: Session = Depends(get_db)):
+async def get_item(
+    item_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
-    Retrieve a specific item by ID.
+    Retrieve a specific item by ID for the authenticated user.
     
     Args:
         item_id (int): The ID of the item to retrieve
@@ -117,11 +222,14 @@ async def get_item(item_id: int, db: Session = Depends(get_db)):
         ItemResponse: The requested item
     """
     try:
-        logger.info(f"Fetching item with ID: {item_id}")
-        item = db.query(Item).filter(Item.id == item_id).first()
+        logger.info(f"Fetching item with ID: {item_id} for user: {current_user.email}")
+        item = db.query(Item).filter(
+            Item.id == item_id,
+            Item.owner_id == current_user.id
+        ).first()
         
         if not item:
-            logger.warning(f"Item with ID {item_id} not found")
+            logger.warning(f"Item with ID {item_id} not found for user {current_user.email}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Item with ID {item_id} not found"
